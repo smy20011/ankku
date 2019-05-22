@@ -4,9 +4,12 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path"
+	"syscall"
 
 	yaml "gopkg.in/yaml.v2"
 
@@ -22,23 +25,39 @@ var (
 	serverProc *exec.Cmd
 )
 
-// Clone or create initial repository.
-func cloneOrOpenRepo(url string) (*git.Repository, error) {
-	repoDir := path.Join(*projectDir, "repo")
-	if info, err := os.Stat(repoDir); err != nil && info != nil {
-		return git.OpenRepository(repoDir)
-	}
-	repo, err := git.InitRepository(repoDir, false)
-	if err != nil {
-		return nil, err
-	}
-	repo.Remotes.Create("origin", url)
-	return repo, err
+// Repository represents a git repository
+type Repository struct {
+	repo      *git.Repository
+	localDir  string
+	remoteURL string
+	branch    string
 }
 
-// Perform git pull command on the repository, return true if repo is updated.
-func gitPull(repo *git.Repository, branch string) (hasUpdate bool, err error) {
-	remote, err := repo.Remotes.Lookup("origin")
+// NewRepository creates a repository object from remote url or local directory.
+func NewRepository(remoteURL, projectDir, branch string) (res Repository, err error) {
+	res.localDir = path.Join(projectDir, "repo")
+	res.remoteURL = remoteURL
+	res.branch = branch
+	if _, err = os.Stat(res.localDir); err == nil {
+		repo, err := git.OpenRepository(res.localDir)
+		if err != nil {
+			return res, err
+		}
+		res.repo = repo
+		return res, nil
+	}
+	repo, err := git.InitRepository(res.localDir, false)
+	if err != nil {
+		return res, err
+	}
+	repo.Remotes.Create("origin", remoteURL)
+	res.repo = repo
+	return
+}
+
+// GitPull performs git pull command on the repository, return true if repo is updated.
+func (repo Repository) GitPull() (hasUpdate bool, err error) {
+	remote, err := repo.repo.Remotes.Lookup("origin")
 	if err != nil {
 		return
 	}
@@ -46,23 +65,23 @@ func gitPull(repo *git.Repository, branch string) (hasUpdate bool, err error) {
 	if err != nil {
 		return
 	}
-	remoteBranch, err := repo.References.Lookup("refs/remotes/origin/" + branch)
+	remoteBranch, err := repo.repo.References.Lookup("refs/remotes/origin/" + repo.branch)
 	if err != nil {
 		return
 	}
-	remoteCommit, err := repo.LookupCommit(remoteBranch.Target())
+	remoteCommit, err := repo.repo.LookupCommit(remoteBranch.Target())
 	if err != nil {
 		return
 	}
-	localBranch, err := repo.LookupBranch(branch, git.BranchLocal)
+	localBranch, err := repo.repo.LookupBranch(repo.branch, git.BranchLocal)
 	if localBranch == nil || err != nil {
-		localBranch, err = repo.CreateBranch(branch, remoteCommit, false)
+		localBranch, err = repo.repo.CreateBranch(repo.branch, remoteCommit, false)
 		if err != nil {
 			return
 		}
-		return true, localBranch.SetUpstream("origin/" + branch)
+		return true, localBranch.SetUpstream("origin/" + repo.branch)
 	}
-	localCommit, err := repo.LookupCommit(localBranch.Target())
+	localCommit, err := repo.repo.LookupCommit(localBranch.Target())
 	if err != nil {
 		return
 	}
@@ -73,17 +92,13 @@ func gitPull(repo *git.Repository, branch string) (hasUpdate bool, err error) {
 	return false, nil
 }
 
-func startApp(repo *git.Repository) error {
-	appDir := path.Join(*projectDir, "app")
-	err := os.RemoveAll(appDir)
+// CheckoutToDir check head of branch to specificed directory.
+func (repo Repository) CheckoutToDir(dir string) error {
+	branch, err := repo.repo.LookupBranch(repo.branch, git.BranchLocal)
 	if err != nil {
 		return err
 	}
-	branch, err := repo.LookupBranch(*branch, git.BranchLocal)
-	if err != nil {
-		return err
-	}
-	commit, err := repo.LookupCommit(branch.Target())
+	commit, err := repo.repo.LookupCommit(branch.Target())
 	if err != nil {
 		return err
 	}
@@ -91,28 +106,44 @@ func startApp(repo *git.Repository) error {
 	if err != nil {
 		return err
 	}
-	err = repo.CheckoutTree(tree, &git.CheckoutOpts{
+	return repo.repo.CheckoutTree(tree, &git.CheckoutOpts{
 		Strategy:        git.CheckoutForce,
-		TargetDirectory: appDir,
+		TargetDirectory: dir,
 	})
+}
+
+type Application struct {
+	repository     Repository
+	environmentDir string
+	applicationDir string
+	commandChannel chan *exec.Cmd
+	stopChannel    chan chan bool
+	port           int
+}
+
+// NewApplication creates a new app.
+func NewApplication(repository Repository, projectDir string, port int) Application {
+	return Application{
+		repository, path.Join(projectDir, "env"),
+		path.Join(projectDir, "app"),
+		make(chan *exec.Cmd),
+		make(chan chan bool),
+		port,
+	}
+}
+
+// Reload start the "web" application defined in the Procfile and
+// restart the app if already started.
+func (app Application) reloadImpl() error {
+	err := app.repository.CheckoutToDir(app.applicationDir)
 	if err != nil {
 		return err
 	}
-	envDir := path.Join(*projectDir, "venv")
-	if _, err := os.Stat(envDir); os.IsNotExist(err) {
-		cmd := exec.Command("virtualenv", envDir)
-		pipeOutputs(cmd)
-		err = cmd.Run()
-		if err != nil {
-			output, _ := cmd.Output()
-			return fmt.Errorf("Error while create virtual env: %s", string(output))
-		}
+	err = app.setupVirtualEnv()
+	if err != nil {
+		return err
 	}
-
-	procFile := path.Join(*projectDir, "app", "Procfile")
-	reader, err := ioutil.ReadFile(procFile)
-	commands := make(map[string]string)
-	err = yaml.Unmarshal(reader, &commands)
+	cmd, err := app.findProcCommand("web")
 	if err != nil {
 		return err
 	}
@@ -123,49 +154,146 @@ func startApp(repo *git.Repository) error {
 	export PORT=%d
 	%s
 	`
-	script := fmt.Sprintf(scriptTmpl, envDir, appDir, *port, commands["web"])
-	serverProc = exec.Command("bash", "-c", script)
-	pipeOutputs(serverProc)
-	return serverProc.Start()
+	script := fmt.Sprintf(scriptTmpl, app.environmentDir, app.applicationDir, app.port, cmd)
+	log.Printf("Starting server command: %v", cmd)
+	command := exec.Command("bash", "-c", script)
+	app.commandChannel <- command
+	return nil
 }
 
-func pipeOutputs(cmd *exec.Cmd) {
+func setupCommand(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Stdout = os.Stdout
-	cmd.Stdin = os.Stdin
 }
 
-func pullAndDeploy(repo *git.Repository) error {
-	updated, err := gitPull(repo, *branch)
-	if err != nil {
-		panic(err)
+func mayKillCommand(command *exec.Cmd) {
+	if command != nil && command.Process != nil {
+		log.Printf("Killing existing process %v", command.Process)
+		pgid, _ := syscall.Getpgid(command.Process.Pid)
+		syscall.Kill(-pgid, syscall.SIGKILL)
 	}
-	if updated || serverProc == nil {
-		return startApp(repo)
-	} else if updated {
-		err = serverProc.Process.Kill()
-		if err != nil {
-			return err
+
+}
+
+// StartDaemon start the monitor process of the server.
+func (app Application) StartDaemon() {
+	go func() {
+		var command *exec.Cmd
+		var done chan error
+		timeFailed := 0
+		for {
+			select {
+			case newCommand := <-app.commandChannel:
+				{
+					mayKillCommand(command)
+					done = make(chan error)
+					timeFailed = 0
+					command = newCommand
+				}
+			case err := <-done:
+				{
+					switch err.(type) {
+					case *exec.ExitError:
+						if err.(*exec.ExitError).ExitCode() != 0 && timeFailed < 3 {
+							timeFailed++
+							log.Printf("Process failed to start %d times, starting.. %v", timeFailed, err)
+							command = exec.Command(command.Path, command.Args...)
+						}
+					default:
+						log.Fatalf("Failed to wait for process: %v", err.Error())
+					}
+				}
+			case out := <-app.stopChannel:
+				log.Println("Process stopped, close all subprocesses!")
+				mayKillCommand(command)
+				out <- true
+				return
+			}
+			setupCommand(command)
+			command.Start()
+			go func(done chan error, command *exec.Cmd) {
+				done <- command.Wait()
+			}(done, command)
 		}
-		startApp(repo)
+	}()
+}
+
+func (app Application) setupVirtualEnv() error {
+	if _, err := os.Stat(app.environmentDir); os.IsNotExist(err) {
+		cmd := exec.Command("virtualenv", app.environmentDir)
+		cmd.Stdout = os.Stdout
+		err = cmd.Run()
+		if err != nil {
+			output, _ := cmd.Output()
+			return fmt.Errorf("Error while create virtual env: %s", string(output))
+		}
 	}
 	return nil
 }
 
+func (app Application) findProcCommand(commandName string) (string, error) {
+	procFile := path.Join(app.applicationDir, "Procfile")
+	reader, err := ioutil.ReadFile(procFile)
+	commands := make(map[string]string)
+	err = yaml.Unmarshal(reader, &commands)
+	if err != nil {
+		return "", err
+	}
+	cmd, exists := commands[commandName]
+	if !exists {
+		return "", fmt.Errorf("Cannot find command named %s", commandName)
+	}
+	return cmd, nil
+}
+
+// Reload start the "web" application defined in the Procfile and
+// restart the app if already started. By default, Reload will only
+// restart server when it's updated, use force to force restart.
+func (app Application) Reload(force bool) error {
+	updated, err := app.repository.GitPull()
+	log.Printf("update: %v", updated)
+	if err != nil {
+		return err
+	}
+	if updated || force {
+		log.Printf("Reload application")
+		return app.reloadImpl()
+	}
+	return nil
+}
+
+func (app Application) Stop() {
+	result := make(chan bool)
+	app.stopChannel <- result
+	<-result
+}
+
 func main() {
 	flag.Parse()
-	repo, err := cloneOrOpenRepo(*gitRepo)
+	repository, err := NewRepository(*gitRepo, *projectDir, *branch)
 	if err != nil {
 		panic(err)
 	}
-	pullAndDeploy(repo)
+
+	application := NewApplication(repository, *projectDir, *port)
+	application.StartDaemon()
+	err = application.Reload(true)
+	if err != nil {
+		panic(err)
+	}
+
 	c := cron.New()
 	c.AddFunc("@every 5s", func() {
-		err := pullAndDeploy(repo)
+		err := application.Reload(false)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to execute application: %v", err)
+			panic(err)
 		}
 	})
 	c.Start()
-	// Block forever
-	select {}
+
+	killed := make(chan os.Signal, 2)
+	signal.Notify(killed, os.Interrupt, os.Kill)
+	<-killed
+	log.Println("Killed")
+	application.Stop()
 }
